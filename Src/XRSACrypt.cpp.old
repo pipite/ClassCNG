@@ -1,0 +1,596 @@
+﻿#include "TestCryptPCH1.h"
+#pragma hdrstop
+
+// Ajouter les bibliothèques nécessaires pour CNG
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "ncrypt.lib")
+
+//#ifndef STATUS_SUCCESS
+//#define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
+//#endif
+
+#include "XRSACrypt.h"
+
+XRSACrypt::XRSACrypt(void) {
+	AESCrypt      = new XAESCrypt();
+	hAlgProvider  = NULL;
+	hProvider     = NULL;
+	hPrivateKey   = NULL;
+	hPublicKey    = NULL;
+	hkey          = NULL;
+}
+
+XRSACrypt::~XRSACrypt(void) {
+	ClearContext();
+    delete AESCrypt;
+}
+
+
+bool __fastcall XRSACrypt::GetPublicReady(void) {
+	return ( publicblob.size() > 0 );
+}
+
+bool __fastcall XRSACrypt::GetPrivateReady(void) {
+	return ( privateblob.size() > 0 );
+}
+
+void __fastcall XRSACrypt::ClearContext(void) {
+	if (hkey != NULL)         BCryptDestroyKey(hkey);
+	if (hPrivateKey != NULL)  NCryptFreeObject(hPrivateKey);
+	if (hPublicKey != NULL)   BCryptDestroyKey(hPublicKey);
+	if (hProvider != NULL)    NCryptFreeObject(hProvider);
+	if (hAlgProvider != NULL) BCryptCloseAlgorithmProvider(hAlgProvider, 0);
+	hkey          = NULL;
+	hProvider     = NULL;
+	hAlgProvider  = NULL;
+
+	hPrivateKey   = NULL;
+	hPublicKey    = NULL;
+
+	// Effacer les blobs
+	privateblob.clear();
+	publicblob.clear();
+}
+
+//---------------------------------------------------------------------------
+// Load/Save des clés
+//---------------------------------------------------------------------------
+bool __fastcall XRSACrypt::LoadKeyFromFile(const std::string &filename, std::vector<BYTE> &buffer) {
+	try {
+		UnicodeString unicodeFilename(filename.c_str());
+		FileToBuffer(unicodeFilename, buffer);
+
+		// Vérifier si c'est notre fichier PEM factice (commence par "-----")
+		bool isPemFile = (buffer.size() > 4 && buffer[0] == '-' && buffer[1] == '-' && buffer[2] == '-' && buffer[3] == '-');
+
+		// Si c'est un fichier PEM factice, on le considère comme valide
+		// sinon on vérifie si c'est une clé valide
+		return isPemFile || IsValid(buffer);
+	}
+	catch (const std::exception&) {
+//		 En cas d'erreur (fichier inexistant, etc.)
+		return false;
+	}
+}
+
+bool __fastcall XRSACrypt::SaveKeyToFile(const std::string &filename, const std::vector<BYTE> &buffer) {
+	// Vérifier si le buffer est valide ou si c'est un fichier spécial (comme notre clé privée factice)
+	bool isSpecialFile = (buffer.size() > 4 &&
+	                      buffer[0] == '-' && buffer[1] == '-' && buffer[2] == '-' && buffer[3] == '-');
+
+	if (IsValid(buffer) || isSpecialFile) {
+		try {
+			UnicodeString unicodeFilename(filename.c_str());
+			return BufferToFile(buffer, unicodeFilename);
+		}
+		catch (const std::exception&) {
+			// En cas d'erreur (problème d'écriture, etc.)
+			return false;
+		}
+	}
+	return false;
+}
+
+//---------------------------------------------------------------------------
+// Verification validité des clés
+//---------------------------------------------------------------------------
+bool __fastcall XRSACrypt::IsPrivateBlob(const std::vector<BYTE> &buffer) {
+	// Dans CNG, nous devons vérifier la structure BCRYPT_RSAKEY_BLOB
+	if (buffer.size() < sizeof(BCRYPT_RSAKEY_BLOB)) return false;
+
+	BCRYPT_RSAKEY_BLOB* keyBlob = reinterpret_cast<BCRYPT_RSAKEY_BLOB*>(const_cast<BYTE*>(buffer.data()));
+
+	// Vérifier si c'est une clé privée (contient l'exposant privé)
+	return (keyBlob->Magic == BCRYPT_RSAFULLPRIVATE_MAGIC ||
+	        keyBlob->Magic == BCRYPT_RSAPRIVATE_MAGIC);
+}
+
+bool __fastcall XRSACrypt::IsPublicBlob(const std::vector<BYTE> &buffer) {
+	// Dans CNG, nous devons vérifier la structure BCRYPT_RSAKEY_BLOB
+	if (buffer.size() < sizeof(BCRYPT_RSAKEY_BLOB)) return false;
+
+	BCRYPT_RSAKEY_BLOB* keyBlob = reinterpret_cast<BCRYPT_RSAKEY_BLOB*>(const_cast<BYTE*>(buffer.data()));
+
+	// Vérifier si c'est une clé publique
+	return (keyBlob->Magic == BCRYPT_RSAPUBLIC_MAGIC);
+}
+
+bool __fastcall XRSACrypt::IsValid(const std::vector<BYTE> &buffer) {
+	BCRYPT_ALG_HANDLE hAlg = NULL;
+	BCRYPT_KEY_HANDLE hKey = NULL;
+	NTSTATUS status;
+	bool isValid = false;
+
+	// Ouvrir le fournisseur d'algorithme RSA
+	status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_RSA_ALGORITHM, NULL, 0);
+	if (!NT_SUCCESS(status)) return false;
+
+	// Tenter d'importer la clé
+	status = BCryptImportKeyPair(hAlg,NULL,IsPublicBlob(buffer) ? BCRYPT_RSAPUBLIC_BLOB : BCRYPT_RSAPRIVATE_BLOB,&hKey,	const_cast<BYTE*>(buffer.data()),buffer.size(),0);
+	if (NT_SUCCESS(status)) {isValid = true; BCryptDestroyKey(hKey); }
+
+	BCryptCloseAlgorithmProvider(hAlg, 0);
+	return isValid;
+}
+
+//---------------------------------------------------------------------------
+// Extraction Private/Public Blob from hkey
+//---------------------------------------------------------------------------
+bool __fastcall XRSACrypt::ExtractPrivateBlob(void) {
+	NTSTATUS status  = -1;
+	ULONG    keysize =  0;
+
+	// Détermination de la taille de la clé privée
+	status = BCryptExportKey(hkey, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, NULL, 0, &keysize, 0);
+	if (!BCRYPT_SUCCESS(status)) { ClearContext(); return false; }
+	privateblob.clear();
+	privateblob.resize(keysize);
+	// exporte le blob de la clé privée
+	status = BCryptExportKey(hkey, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, privateblob.data(), keysize, &keysize, 0);
+	if (!BCRYPT_SUCCESS(status)) { ClearContext(); return false; }
+	return true;
+}
+
+bool __fastcall XRSACrypt::ExtractPublicBlob(void) {
+	NTSTATUS status  = -1;
+	ULONG    keysize =  0;
+
+	// Détermination de la taille de la clé publique
+	status = BCryptExportKey(hkey, NULL, BCRYPT_RSAPUBLIC_BLOB, NULL, 0, &keysize, 0);
+	if (!BCRYPT_SUCCESS(status)) { ClearContext(); return false; }
+	publicblob.clear();
+	publicblob.resize(keysize);
+	// exporte le blob de la clé publique
+	status = BCryptExportKey(hkey, NULL, BCRYPT_RSAPUBLIC_BLOB, publicblob.data(), keysize, &keysize, 0);
+	if (!BCRYPT_SUCCESS(status)) { ClearContext(); return false; }
+	return true;
+}
+
+//---------------------------------------------------------------------------
+// Création, chargement, sauvegarde des paires de clés RSA
+//---------------------------------------------------------------------------
+bool __fastcall XRSACrypt::GenerateKeyPair(void) {
+	NTSTATUS status  = -1;
+	ULONG    keysize =  0;
+
+	// Nettoyer les clés existantes
+	ClearContext();
+
+	// Ouvrir le fournisseur d'algorithme RSA pour la clé publique
+	status = BCryptOpenAlgorithmProvider(&hAlgProvider, BCRYPT_RSA_ALGORITHM, NULL, 0);
+	if (!BCRYPT_SUCCESS(status)) return false;
+
+	// Génération de la paire de clés
+	status = BCryptGenerateKeyPair(hAlgProvider, &hkey, 2048, 0);
+	if (!BCRYPT_SUCCESS(status)) { ClearContext(); return false; }
+
+	// Finalisation de la clé
+	status = BCryptFinalizeKeyPair(hkey, 0);
+	if (!BCRYPT_SUCCESS(status)) { ClearContext(); return false; }
+
+	ExtractPublicBlob();
+	ExtractPrivateBlob();
+
+	if (hAlgProvider) BCryptCloseAlgorithmProvider(hAlgProvider, 0);
+
+	return true;
+}
+
+bool __fastcall XRSACrypt::ImportBlob(const UnicodeString& filename) {
+	std::vector<BYTE> blob;
+	NTSTATUS status = -1;
+
+	// Nettoyer les clés existantes
+	ClearContext();
+
+	// Charger le blob depuis le fichier
+	if (!FileToBuffer(filename, blob) || blob.empty()) {
+		return false;
+	}
+
+	// Vérifier si c'est un blob de clé privée ou publique
+	bool isPrivate = IsPrivateBlob(blob);
+	bool isPublic = IsPublicBlob(blob);
+
+	if (!isPrivate && !isPublic) {
+		return false; // Ni privé ni public, format invalide
+	}
+
+	// Ouvrir le fournisseur d'algorithme RSA
+	status = BCryptOpenAlgorithmProvider(&hAlgProvider, BCRYPT_RSA_ALGORITHM, NULL, 0);
+	if (!NT_SUCCESS(status)) return false;
+
+	if (isPrivate) {
+		// Importer la clé privée
+		privateblob = blob; // Stocker le blob privé
+
+		// Importer la clé privée dans BCrypt pour les opérations
+		status = BCryptImportKeyPair(hAlgProvider, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, &hkey,
+			const_cast<BYTE*>(privateblob.data()), privateblob.size(), 0);
+		if (!NT_SUCCESS(status)) {
+			ClearContext();
+			return false;
+		}
+
+		// Extraire également le blob public à partir de la clé privée
+		ExtractPublicBlob();
+	} else {
+		// Importer la clé publique
+		publicblob = blob; // Stocker le blob public
+
+		// Importer la clé publique dans BCrypt pour les opérations
+		status = BCryptImportKeyPair(hAlgProvider, NULL, BCRYPT_RSAPUBLIC_BLOB, &hPublicKey,
+			const_cast<BYTE*>(publicblob.data()), publicblob.size(), 0);
+		if (!NT_SUCCESS(status)) {
+			ClearContext();
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool __fastcall XRSACrypt::ExportPrivateBlob(const std::string &filename) {
+	if (privateblob.size() > 0) {
+		UnicodeString unicodeFilename(filename.c_str());
+		return BufferToFile(privateblob, unicodeFilename);
+	}
+	return false;
+}
+
+bool __fastcall XRSACrypt::ExportPublicBlob(const std::string &filename) {
+	if (publicblob.size() > 0) {
+		UnicodeString unicodeFilename(filename.c_str());
+		return BufferToFile(publicblob, unicodeFilename);
+	}
+	return false;
+}
+
+//---------------------------------------------------------------------------
+// Cryptage / Decryptage RSA-SHA-AES String
+//---------------------------------------------------------------------------
+
+UnicodeString __fastcall XRSACrypt::EncryptString(const UnicodeString& str) {
+	if (!PublicReady) return L"Erreur: Clé publique non initialisée";
+	try {
+		std::vector<BYTE> buff;
+		std::vector<BYTE> encryptedBuffer;
+
+		UnicodeToBuffer(str, buff);
+		if ( EncryptBuffer(buff, encryptedBuffer) ) {
+			return BufferToHex(encryptedBuffer);
+		}
+		return L"Erreur: Cryptage RSA impossible.";
+	}
+		catch (const std::exception& e) {
+		return UnicodeString(L"Erreur: ") + UnicodeString(e.what());
+	}
+}
+
+UnicodeString __fastcall XRSACrypt::DecryptString(const UnicodeString& hexstr) {
+	if (!PrivateReady) { return L"Erreur: Clé privée non initialisée"; }
+	try {
+		std::vector<BYTE> buff;
+		std::vector<BYTE> decryptedBuffer;
+
+		HexToBuffer(hexstr,buff);
+		if ( DecryptBuffer(buff, decryptedBuffer) ) {
+			return BufferToUnicode(decryptedBuffer);
+        }
+		return L"Erreur: Dércyptage RSA impossible.";
+	}
+	catch (const std::exception& e) {
+		return UnicodeString(L"Erreur: ") + UnicodeString(e.what());
+	}
+}
+
+//---------------------------------------------------------------------------
+// Crypte / Decrypte RSA-SHA-AES un fichier
+//---------------------------------------------------------------------------
+bool __fastcall XRSACrypt::EncryptFile(const UnicodeString& infile, const UnicodeString& outfile) {
+	if (!PublicReady) return L"Erreur: Clé publique non initialisée";
+	try {
+		std::vector<BYTE> fileBuffer;
+		std::vector<BYTE> encryptedData;
+
+		FileToBuffer(infile,fileBuffer);
+		EncryptBuffer(fileBuffer, encryptedData);
+		return BufferToFile(encryptedData, outfile);
+	} catch (const std::exception& e) {
+		return false;
+	}
+}
+
+bool __fastcall XRSACrypt::DecryptFile(const UnicodeString& infile, const UnicodeString& outfile) {
+	if (!PrivateReady) { return L"Erreur: Clé privée non initialisée"; }
+	try {
+		std::vector<BYTE> fileBuffer;
+		std::vector<BYTE> decryptedData;
+
+		FileToBuffer(infile,fileBuffer);
+		if ( DecryptBuffer(fileBuffer, decryptedData) ) {
+			return BufferToFile(decryptedData, outfile);
+		} else {
+			return false;
+        }
+	} catch (const std::exception& e) {
+        return false;
+    }
+}
+
+//---------------------------------------------------------------------------
+// Crypte / Decrypte RSA-SHA-AES un buffer
+//---------------------------------------------------------------------------
+bool __fastcall XRSACrypt::EncryptBuffer(const std::vector<BYTE>& data, std::vector<BYTE>& cryptdata) {
+	if (!PublicReady) return false; // Erreur: Clé publique non initialisée
+
+	try {
+		// Générer une clé AES aléatoire pour le chiffrement symétrique
+		std::vector<BYTE> aesKeyMaterial(AESCrypt->IVSIZE);
+
+		// Ouvrir le fournisseur d'algorithme RNG
+		BCRYPT_ALG_HANDLE hRng = NULL;
+		NTSTATUS status = BCryptOpenAlgorithmProvider(&hRng, BCRYPT_RNG_ALGORITHM, NULL, 0);
+		if (!NT_SUCCESS(status)) return false; // Erreur: Impossible d'ouvrir le fournisseur RNG
+
+		// Générer une clé AES aléatoire
+		status = BCryptGenRandom(hRng, aesKeyMaterial.data(), aesKeyMaterial.size(), 0);
+		BCryptCloseAlgorithmProvider(hRng, 0);
+		if (!NT_SUCCESS(status)) return false; // Erreur: Impossible de générer une clé AES aléatoire
+
+		// Créer un nouvel objet XAESCrypt pour cette opération
+		XAESCrypt* tempAESCrypt = new XAESCrypt();
+
+		// Initialiser le nouvel objet AESCrypt avec cette clé aléatoire
+		UnicodeString aesPassword = BufferToHex(aesKeyMaterial);
+		if ( !tempAESCrypt->NewSecureKey(aesPassword, 1) ) {
+			delete tempAESCrypt;
+			return false; // Erreur: Impossible de créer la clé AES
+		}
+
+		// Récupérer le sel utilisé pour la dérivation de clé
+		std::vector<BYTE> saltUsed = tempAESCrypt->GetSalt();
+
+		// Chiffrer les données avec AES
+		std::vector<BYTE> aesEncryptedData;
+		if (!tempAESCrypt->EncryptBuffer(data, aesEncryptedData)) {
+			delete tempAESCrypt;
+			return false; // Erreur: Échec du chiffrement AES
+		}
+
+		// Libérer l'objet AESCrypt temporaire
+		delete tempAESCrypt;
+
+		// Maintenant, chiffrer la clé AES avec RSA (clé publique)
+		// Ouvrir le fournisseur d'algorithme RSA
+		BCRYPT_ALG_HANDLE hRsaAlg = NULL;
+		status = BCryptOpenAlgorithmProvider(&hRsaAlg, BCRYPT_RSA_ALGORITHM, NULL, 0);
+		if (!NT_SUCCESS(status)) return false; // Erreur: Impossible d'ouvrir le fournisseur RSA
+
+		// Importer la clé publique
+		BCRYPT_KEY_HANDLE hRsaKey = NULL;
+		status = BCryptImportKeyPair(hRsaAlg, NULL, BCRYPT_RSAPUBLIC_BLOB, &hRsaKey, const_cast<BYTE*>(publicblob.data()), publicblob.size(), 0);
+		if (!NT_SUCCESS(status)) {
+			BCryptCloseAlgorithmProvider(hRsaAlg, 0);
+			return false; // Erreur: Impossible d'importer la clé publique RSA
+		}
+
+		// Chiffrer la clé AES avec RSA
+		DWORD encryptedKeySize = 0;
+		status = BCryptEncrypt(hRsaKey, aesKeyMaterial.data(), aesKeyMaterial.size(), NULL, NULL, 0, NULL, 0, &encryptedKeySize, BCRYPT_PAD_PKCS1);
+		if (!NT_SUCCESS(status)) {
+			BCryptDestroyKey(hRsaKey);
+			BCryptCloseAlgorithmProvider(hRsaAlg, 0);
+			return false; // Erreur: Impossible de déterminer la taille de la clé AES chiffrée
+		}
+
+		std::vector<BYTE> encryptedKey(encryptedKeySize);
+		status = BCryptEncrypt(hRsaKey, aesKeyMaterial.data(), aesKeyMaterial.size(), NULL, NULL, 0, encryptedKey.data(), encryptedKey.size(), &encryptedKeySize, BCRYPT_PAD_PKCS1);
+
+		BCryptDestroyKey(hRsaKey);
+		BCryptCloseAlgorithmProvider(hRsaAlg, 0);
+
+		if (!NT_SUCCESS(status)) return false; // Erreur: Impossible de chiffrer la clé AES avec RSA
+
+		// Combiner la clé AES chiffrée, le sel et les données chiffrées
+		// Format: [Taille de la clé chiffrée (4 octets)][Clé AES chiffrée][Taille du sel (4 octets)][Sel][Données chiffrées AES]
+		DWORD keySize = encryptedKey.size();
+		DWORD saltSize = saltUsed.size();
+		cryptdata.resize(4 + keySize + 4 + saltSize + aesEncryptedData.size());
+
+		// Écrire la taille de la clé chiffrée (4 octets)
+		memcpy(cryptdata.data(), &keySize, 4);
+		// Écrire la clé chiffrée
+		memcpy(cryptdata.data() + 4, encryptedKey.data(), keySize);
+		// Écrire la taille du sel (4 octets)
+		memcpy(cryptdata.data() + 4 + keySize, &saltSize, 4);
+		// Écrire le sel
+		memcpy(cryptdata.data() + 4 + keySize + 4, saltUsed.data(), saltSize);
+		// Écrire les données chiffrées
+		memcpy(cryptdata.data() + 4 + keySize + 4 + saltSize, aesEncryptedData.data(), aesEncryptedData.size());
+
+		// Convertir en hexadécimal
+		return true;
+	} catch (...) {
+		return false; // Erreur: Exception inconnue lors du chiffrement
+	}
+}
+
+bool __fastcall XRSACrypt::SetPublicBlob(const std::vector<BYTE>& blob) {
+	// Vérifier que c'est un blob de clé publique valide
+	if (!IsPublicBlob(blob) || !IsValid(blob)) return false;
+	
+	// Nettoyer les clés existantes
+	if (hPublicKey != NULL) {
+		BCryptDestroyKey(hPublicKey);
+		hPublicKey = NULL;
+	}
+	
+	// Stocker le blob
+	publicblob = blob;
+	
+	// Importer la clé publique
+	NTSTATUS status;
+	BCRYPT_ALG_HANDLE hRsaAlg = NULL;
+	status = BCryptOpenAlgorithmProvider(&hRsaAlg, BCRYPT_RSA_ALGORITHM, NULL, 0);
+	if (!NT_SUCCESS(status)) return false;
+	
+	status = BCryptImportKeyPair(hRsaAlg, NULL, BCRYPT_RSAPUBLIC_BLOB, &hPublicKey,
+		const_cast<BYTE*>(publicblob.data()), publicblob.size(), 0);
+	
+	BCryptCloseAlgorithmProvider(hRsaAlg, 0);
+	
+	return NT_SUCCESS(status);
+}
+
+bool __fastcall XRSACrypt::SetPrivateBlob(const std::vector<BYTE>& blob) {
+	// Vérifier que c'est un blob de clé privée valide
+	if (!IsPrivateBlob(blob) || !IsValid(blob)) return false;
+	
+	// Nettoyer les clés existantes
+	ClearContext();
+	
+	// Stocker le blob
+	privateblob = blob;
+	
+	// Importer la clé privée
+	NTSTATUS status;
+	BCRYPT_ALG_HANDLE hRsaAlg = NULL;
+	status = BCryptOpenAlgorithmProvider(&hRsaAlg, BCRYPT_RSA_ALGORITHM, NULL, 0);
+	if (!NT_SUCCESS(status)) return false;
+	
+	status = BCryptImportKeyPair(hRsaAlg, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, &hkey,
+		const_cast<BYTE*>(privateblob.data()), privateblob.size(), 0);
+	
+	if (NT_SUCCESS(status)) {
+		// Extraire également le blob public à partir de la clé privée
+		ExtractPublicBlob();
+	} else {
+		ClearContext();
+	}
+	
+	BCryptCloseAlgorithmProvider(hRsaAlg, 0);
+	
+	return NT_SUCCESS(status);
+}
+
+bool __fastcall XRSACrypt::DecryptBuffer(const std::vector<BYTE>& encrypteddata, std::vector<BYTE>& uncrypt) {
+	if (!PrivateReady) return false; // Erreur: Clé privée non initialisée
+
+	try {
+		// Convertir la chaîne hexadécimale en données binaires
+		// Au moins 4 octets pour la taille + quelques octets pour les données
+		if (encrypteddata.size() < 8) return false; // Erreur: Données chiffrées invalides ou corrompues
+
+		// Extraire la taille de la clé chiffrée (4 premiers octets)
+		DWORD encryptedKeySize = 0;
+		memcpy(&encryptedKeySize, encrypteddata.data(), 4);
+
+		// Vérifier que les données sont cohérentes
+		if (encrypteddata.size() < 4 + encryptedKeySize || encryptedKeySize == 0) return false; // Erreur: Données chiffrées invalides ou corrompues
+
+		// Extraire la clé AES chiffrée
+		std::vector<BYTE> encryptedKey(encryptedKeySize);
+		memcpy(encryptedKey.data(), encrypteddata.data() + 4, encryptedKeySize);
+
+		// Extraire la taille du sel (4 octets après la clé chiffrée)
+		DWORD saltSize = 0;
+		if (encrypteddata.size() < 4 + encryptedKeySize + 4) return false; // Erreur: Données chiffrées invalides ou corrompues (pas de sel)
+		memcpy(&saltSize, encrypteddata.data() + 4 + encryptedKeySize, 4);
+
+		// Vérifier que les données sont cohérentes
+		if (encrypteddata.size() < 4 + encryptedKeySize + 4 + saltSize || saltSize == 0) return false; // Erreur: Données chiffrées invalides ou corrompues (sel invalide)
+
+		// Extraire le sel
+		std::vector<BYTE> salt(saltSize);
+		memcpy(salt.data(), encrypteddata.data() + 4 + encryptedKeySize + 4, saltSize);
+
+		// Extraire les données chiffrées avec AES
+		std::vector<BYTE> aesEncryptedData(encrypteddata.size() - 4 - encryptedKeySize - 4 - saltSize);
+		memcpy(aesEncryptedData.data(), encrypteddata.data() + 4 + encryptedKeySize + 4 + saltSize, aesEncryptedData.size());
+
+		// Déchiffrer la clé AES avec la clé privée RSA
+		// Utiliser directement le blob de clé privée que nous avons déjà
+		if (privateblob.empty()) return false; // Erreur: Blob de clé privée non disponible
+
+		// Nous utilisons directement privateblob qui contient déjà la clé privée
+		NTSTATUS status;
+
+		// Ouvrir le fournisseur d'algorithme RSA
+		BCRYPT_ALG_HANDLE hRsaAlg = NULL;
+		status = BCryptOpenAlgorithmProvider(&hRsaAlg, BCRYPT_RSA_ALGORITHM, NULL, 0);
+		if (!NT_SUCCESS(status)) return false; // Erreur: Impossible d'ouvrir le fournisseur RSA
+
+		// Importer la clé privée à partir du blob stocké
+		BCRYPT_KEY_HANDLE hRsaKey = NULL;
+		status = BCryptImportKeyPair(hRsaAlg, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, &hRsaKey,const_cast<BYTE*>(privateblob.data()), privateblob.size(), 0);
+		if (!NT_SUCCESS(status)) {
+			BCryptCloseAlgorithmProvider(hRsaAlg, 0);
+			return false; // Erreur: Impossible d'importer la clé privée RSA
+		}
+
+		// Déchiffrer la clé AES
+		DWORD decryptedKeySize = 0;
+		status = BCryptDecrypt(hRsaKey, encryptedKey.data(), encryptedKey.size(), NULL, NULL, 0, NULL, 0, &decryptedKeySize, BCRYPT_PAD_PKCS1);
+		if (!NT_SUCCESS(status)) {
+			BCryptDestroyKey(hRsaKey);
+			BCryptCloseAlgorithmProvider(hRsaAlg, 0);
+			return false; // Erreur: Impossible de déterminer la taille de la clé AES déchiffrée";
+		}
+
+		std::vector<BYTE> aesKeyMaterial(decryptedKeySize);
+		status = BCryptDecrypt(hRsaKey, encryptedKey.data(), encryptedKey.size(), NULL, NULL, 0, aesKeyMaterial.data(), aesKeyMaterial.size(), &decryptedKeySize, BCRYPT_PAD_PKCS1);
+
+		BCryptDestroyKey(hRsaKey);
+		BCryptCloseAlgorithmProvider(hRsaAlg, 0);
+
+		if (!NT_SUCCESS(status)) return false; // Erreur: Impossible de déchiffrer la clé AES avec RSA"; }
+
+		// Créer un nouvel objet XAESCrypt pour cette opération
+		XAESCrypt* tempAESCrypt = new XAESCrypt();
+
+		// Initialiser le nouvel objet AESCrypt avec la clé déchiffrée et le sel récupéré
+		UnicodeString aesPassword = BufferToHex(aesKeyMaterial);
+		if (!tempAESCrypt->NewSecureKey(aesPassword, salt, 1)) {
+			delete tempAESCrypt;
+			return false; // Erreur: Impossible de créer la clé AES";
+		}
+
+		// Déchiffrer les données avec AES
+		bool decryptResult = tempAESCrypt->DecryptBuffer(aesEncryptedData, uncrypt);
+
+		// Libérer l'objet AESCrypt temporaire
+		delete tempAESCrypt;
+
+		if (!decryptResult) return false; // Erreur: Échec du déchiffrement AES"; }
+
+		// Convertir les données déchiffrées (UTF-8) en UnicodeString
+		// Ajouter un terminateur nul pour la conversion en chaîne
+		uncrypt.push_back(0);
+
+		return true;
+	}
+	catch (const std::exception& e) { return false; } // UnicodeString(L"Erreur: ") + UnicodeString(e.what())
+	return false;
+}
+

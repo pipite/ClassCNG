@@ -1,0 +1,23 @@
+﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <PropertyGroup>
+        <AppDPIAwarenessMode>PerMonitorV2</AppDPIAwarenessMode>
+        <BCC_UseClassicCompiler>false</BCC_UseClassicCompiler>
+        <ILINK_LibraryPath>$(BDSLIB)\$(PLATFORM)$(CC_SUFFIX)\debug;$(ILINK_LibraryPath)</ILINK_LibraryPath>
+        <IntermediateOutputDir>..\Compil\</IntermediateOutputDir>
+        <FinalOutputDir>..\Bin\</FinalOutputDir>
+        <BCC_OutputDir>..\Obj\</BCC_OutputDir>
+        <VerInfo_IncludeVerInfo>true</VerInfo_IncludeVerInfo>
+        <VerInfo_Locale>1033</VerInfo_Locale>
+        <DynamicRTL>false</DynamicRTL>
+        <UsePackages>false</UsePackages>
+        <BRCC_OutputDir>..\Res\</BRCC_OutputDir>
+    </PropertyGroup>
+    <ProjectExtensions>
+        <Borland.Personality>CPlusPlusBuilder.Personality.12</Borland.Personality>
+        <Borland.ProjectType>OptionSet</Borland.ProjectType>
+        <BorlandProject>
+            <CPlusPlusBuilder.Personality/>
+        </BorlandProject>
+        <ProjectFileVersion>12</ProjectFileVersion>
+    </ProjectExtensions>
+</Project>
